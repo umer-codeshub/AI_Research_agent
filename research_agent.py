@@ -15,6 +15,7 @@ import os
 import re
 import tempfile
 import time
+import traceback
 from datetime import date
 
 # These MUST be set before crewai is imported.
@@ -171,12 +172,21 @@ def explain_error(error):
         )
     if "connection" in text or "timeout" in text or "timed out" in text or "network" in text:
         return "Network problem: could not reach Groq or the web. Check your internet connection and try again."
-    if "litellm" in text:
+    if isinstance(error, ImportError) and ("litellm" in text or "fallback" in text):
+        # Only blame installation when the package genuinely failed to import.
         return (
-            "CrewAI could not load its Groq connector (LiteLLM). "
-            "Make sure you installed the requirements with: pip install -r requirements.txt"
+            "CrewAI could not load its Groq connector (LiteLLM), so it is not installed "
+            "correctly. Make sure requirements.txt contains 'crewai[litellm]' and reinstall. "
+            f"Details: {type(error).__name__}: {error}"
         )
-    return f"The research failed unexpectedly. Details: {type(error).__name__}: {error}"
+    if "tool_use_failed" in text or "failed to call a function" in text:
+        return (
+            "The model produced an invalid tool call (a known quirk of this model on Groq). "
+            "Please click Start Research again. "
+            f"Details: {str(error)[:600]}"
+        )
+    # Unknown error: show the REAL message so it can actually be diagnosed.
+    return f"The research failed. Details: {type(error).__name__}: {str(error)[:1200]}"
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +295,7 @@ def run_research(topic):
         except ResearchError:
             raise
         except Exception as e:
+            traceback.print_exc()  # full details go to the terminal / Streamlit "Manage app" logs
             if attempt == 0 and is_rate_limit(e):
                 time.sleep(RATE_LIMIT_WAIT_SECONDS)
                 continue
