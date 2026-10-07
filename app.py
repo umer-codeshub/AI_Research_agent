@@ -5,7 +5,25 @@ This file only handles input and display. All AI logic is in research_agent.py.
 Run locally with:  streamlit run app.py
 """
 
+# --- Must run BEFORE anything imports sqlite3 / crewai / chromadb ----------
+# Streamlit Cloud's system SQLite is too old for ChromaDB (used by CrewAI).
+# If pysqlite3 is installed (Linux), use it instead. Otherwise do nothing.
+import sys
+
+try:
+    import pysqlite3  # noqa: F401
+
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+
 import os
+
+# Turn off CrewAI telemetry: it tries to register signal handlers and make
+# network calls, which can misbehave inside Streamlit's script thread.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 import streamlit as st
 
@@ -15,19 +33,20 @@ st.set_page_config(page_title="AI Research Agent", page_icon="🔎", layout="cen
 # so we copy the key across. Locally there is no secrets file, so we ignore the error.
 try:
     if "GROQ_API_KEY" in st.secrets:
-        os.environ["GROQ_API_KEY"] = str(st.secrets["GROQ_API_KEY"])
+        os.environ["GROQ_API_KEY"] = str(st.secrets["GROQ_API_KEY"]).strip().strip("\"'")
 except Exception:
     pass
 
-# Import the agent. If a package is missing/broken, show a clear message instead of a traceback.
+# Import the agent. Catch ANY import-time failure (not only ImportError), because
+# version conflicts often raise RuntimeError / AttributeError / pydantic errors.
 try:
     from research_agent import ResearchError, run_research
-except ImportError as import_error:
+except Exception as import_error:
     st.error(
-        "A required package could not be imported. "
-        "Check that requirements.txt installed correctly and that you are using Python 3.10-3.13."
+        "The research agent could not be loaded. Check that requirements.txt installed "
+        "correctly and that you are using Python 3.10-3.13 (3.12 recommended)."
     )
-    st.code(str(import_error))
+    st.code(f"{type(import_error).__name__}: {import_error}")
     st.stop()
 
 # --- Page header -----------------------------------------------------------
@@ -40,6 +59,7 @@ st.write(
 topic = st.text_input(
     "Enter a topic to research:",
     placeholder="e.g. How do solid-state batteries work?",
+    max_chars=300,
 )
 start = st.button("Start Research", type="primary")
 
@@ -50,7 +70,10 @@ if start:
     else:
         st.session_state.pop("result", None)
         try:
-            with st.spinner("Searching the web and writing your report... (can take 30-90 seconds)"):
+            with st.spinner(
+                "Searching the web and writing your report... (can take 30-90 seconds, "
+                "please don't click anything else)"
+            ):
                 st.session_state["result"] = run_research(topic)
                 st.session_state["topic"] = topic.strip()
         except ResearchError as e:
@@ -73,7 +96,8 @@ if result:
 
     with st.expander(f"Search results the agent actually retrieved ({len(result['sources'])})"):
         for i, src in enumerate(result["sources"], start=1):
-            st.markdown(f"{i}. [{src['title'] or src['url']}]({src['url']})")
+            label = (src["title"] or src["url"]).replace("[", "(").replace("]", ")")
+            st.markdown(f"{i}. [{label}]({src['url']})")
 
     st.download_button(
         "Download report (.md)",
