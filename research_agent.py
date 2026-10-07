@@ -13,13 +13,21 @@ app.py (the Streamlit UI) only calls run_research(topic).
 
 import os
 import re
+import tempfile
 import time
 from datetime import date
 
-from crewai import LLM, Agent, Crew, Process, Task
-from crewai.tools import tool
-from ddgs import DDGS
-from dotenv import load_dotenv
+# These MUST be set before crewai is imported.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+# Some hosts (e.g. Streamlit Cloud) only allow writing to the temp folder.
+os.environ.setdefault("CREWAI_STORAGE_DIR", os.path.join(tempfile.gettempdir(), "crewai_storage"))
+
+from crewai import LLM, Agent, Crew, Process, Task  # noqa: E402
+from crewai.tools import tool  # noqa: E402
+from ddgs import DDGS  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
 
 # Reads the .env file when running locally. On Streamlit Cloud there is no
 # .env file, and app.py copies the Streamlit secret into the environment instead.
@@ -30,7 +38,8 @@ load_dotenv()
 MODEL_NAME = "groq/openai/gpt-oss-120b"
 
 MAX_SEARCH_RESULTS = 5  # results per search
-SNIPPET_LENGTH = 500  # characters kept per result (keeps prompts small -> fewer rate limits)
+SNIPPET_LENGTH = 400  # characters kept per result (small prompts -> fewer rate-limit errors)
+RATE_LIMIT_WAIT_SECONDS = 25  # pause before the one automatic retry
 
 
 class ResearchError(Exception):
@@ -55,13 +64,17 @@ def make_search_tool(collected):
         Returns numbered results with title, URL and snippet.
         If the search fails, the output starts with SEARCH_FAILED."""
         last_error = "unknown error"
+        query = str(query or "").strip()
+        if not query:
+            return "SEARCH_FAILED: the query was empty. No information was retrieved."
 
-        for _attempt in range(2):  # try twice, DuckDuckGo sometimes fails once
+        for attempt in range(2):  # try twice, DuckDuckGo sometimes fails once
             try:
                 results = DDGS().text(query, max_results=MAX_SEARCH_RESULTS)
             except Exception as e:  # network error, rate limit, blocked IP, ...
                 last_error = f"{type(e).__name__}: {e}"
-                time.sleep(2)
+                if attempt == 0:
+                    time.sleep(2)
                 continue
 
             lines = []
@@ -94,42 +107,67 @@ def make_search_tool(collected):
 # 2. Groq LLM
 # ---------------------------------------------------------------------------
 def get_llm():
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    api_key = os.getenv("GROQ_API_KEY", "").strip().strip("\"'")
     if not api_key or api_key == "your_groq_api_key_here":
         raise ResearchError(
             "GROQ_API_KEY is missing. Locally: put it in your .env file. "
             "On Streamlit Cloud: add it under App settings -> Secrets."
         )
-    return LLM(
+
+    settings = dict(
         model=MODEL_NAME,
         api_key=api_key,
         temperature=0.2,  # low = more factual, less creative
-        max_tokens=4096,
+        # gpt-oss is a reasoning model: its hidden "thinking" tokens count toward this
+        # limit, so it must be generous or the report can come back cut off or empty.
+        max_tokens=6000,
+        timeout=120,
     )
+    try:
+        # "low" keeps thinking short: faster, and uses less of Groq's tokens-per-minute budget.
+        return LLM(reasoning_effort="low", **settings)
+    except TypeError:
+        # Older CrewAI versions do not know this option.
+        return LLM(**settings)
 
 
 # ---------------------------------------------------------------------------
 # 3. Error translation
 # ---------------------------------------------------------------------------
+def is_rate_limit(error):
+    text = f"{type(error).__name__}: {error}".lower()
+    return bool(re.search(r"\b429\b", text)) or "rate limit" in text or "rate_limit" in text
+
+
 def explain_error(error):
     """Turn a confusing exception into a message a beginner can act on."""
     text = f"{type(error).__name__}: {error}".lower()
 
-    if "401" in text or "invalid api key" in text or "authentication" in text:
+    if re.search(r"\b401\b", text) or "invalid api key" in text or "authentication" in text:
         return (
             "Groq rejected your API key (authentication error). "
             "Check that GROQ_API_KEY is correct, has no extra spaces or quotes, "
             "and has not been deleted in the Groq console."
         )
-    if "429" in text or "rate limit" in text or "rate_limit" in text:
+    if is_rate_limit(error):
         return (
             "Groq rate limit reached. Wait about a minute and try again, "
             "or use a shorter, more focused topic."
+        )
+    if re.search(r"\b413\b", text) or "request too large" in text or "tokens per minute" in text:
+        return (
+            "The request was too large for Groq's per-minute token limit. "
+            "Wait a minute and try again with a shorter, more focused topic."
         )
     if "model_not_found" in text or "does not exist" in text or "decommissioned" in text:
         return (
             f"Groq says the model is unavailable. The app is using '{MODEL_NAME}'. "
             "Check the model list in the Groq console and update MODEL_NAME in research_agent.py."
+        )
+    if "sqlite" in text:
+        return (
+            "The server's SQLite version is too old for CrewAI. Make sure "
+            "'pysqlite3-binary' is in requirements.txt and that app.py was not changed."
         )
     if "connection" in text or "timeout" in text or "timed out" in text or "network" in text:
         return "Network problem: could not reach Groq or the web. Check your internet connection and try again."
@@ -147,11 +185,12 @@ def explain_error(error):
 def find_unverified_urls(report, collected):
     """Return URLs that appear in the report but were NOT returned by the search tool."""
     real = {item["url"].rstrip("/") for item in collected}
-    found = re.findall(r"https?://[^\s)\]>\"']+", report)
+    found = re.findall(r"https?://[^\s)\]>\"'<]+", report)
     bad = []
     for url in found:
-        clean = url.rstrip(".,;:").rstrip("/")
-        if clean not in real and clean not in bad:
+        # Strip trailing punctuation and markdown symbols (e.g. **bold**, `code`).
+        clean = url.rstrip(".,;:*_`").rstrip("/")
+        if clean and clean not in real and clean not in bad:
             bad.append(clean)
     return bad
 
@@ -159,17 +198,8 @@ def find_unverified_urls(report, collected):
 # ---------------------------------------------------------------------------
 # 5. The research function the UI calls
 # ---------------------------------------------------------------------------
-def run_research(topic):
-    topic = (topic or "").strip()
-    if not topic:
-        raise ResearchError("Please enter a research topic first.")
-    if len(topic) > 300:
-        raise ResearchError("Please keep the topic under 300 characters.")
-
-    llm = get_llm()
-    collected = []
-    search_tool = make_search_tool(collected)
-
+def build_crew(llm, search_tool):
+    """Create a fresh agent + task + crew (a fresh one is needed for a clean retry)."""
     agent = Agent(
         role="Careful Research Analyst",
         goal=(
@@ -227,21 +257,40 @@ def run_research(topic):
         agent=agent,
     )
 
-    crew = Crew(
+    return Crew(
         agents=[agent],
         tasks=[task],
         process=Process.sequential,
         verbose=False,
     )
 
-    try:
-        result = crew.kickoff(inputs={"topic": topic, "today": date.today().isoformat()})
-    except ResearchError:
-        raise
-    except Exception as e:
-        raise ResearchError(explain_error(e)) from e
 
-    report = str(getattr(result, "raw", result)).strip()
+def run_research(topic):
+    topic = (topic or "").strip()
+    if not topic:
+        raise ResearchError("Please enter a research topic first.")
+    if len(topic) > 300:
+        raise ResearchError("Please keep the topic under 300 characters.")
+
+    llm = get_llm()
+    collected = []
+    search_tool = make_search_tool(collected)
+    inputs = {"topic": topic, "today": date.today().isoformat()}
+
+    result = None
+    for attempt in range(2):  # one automatic retry, only for Groq rate limits
+        try:
+            result = build_crew(llm, search_tool).kickoff(inputs=inputs)
+            break
+        except ResearchError:
+            raise
+        except Exception as e:
+            if attempt == 0 and is_rate_limit(e):
+                time.sleep(RATE_LIMIT_WAIT_SECONDS)
+                continue
+            raise ResearchError(explain_error(e)) from e
+
+    report = str(getattr(result, "raw", result) or "").strip()
 
     # If no search ever returned anything, the report cannot be based on web research.
     if not collected:
