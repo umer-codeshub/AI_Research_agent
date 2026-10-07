@@ -1,4 +1,5 @@
-crewai[litellm]>=1.15,<2
+crewai>=1.15,<2
+litellm>=1.60
 ddgs>=9.5
 streamlit>=1.40
 python-dotenv>=1.0
