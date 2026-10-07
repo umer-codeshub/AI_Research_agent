@@ -1,5 +1,15 @@
-crewai>=1.15,<2
-litellm>=1.60
+# Agent framework. The [litellm] extra is REQUIRED for Groq (Groq is not a native CrewAI provider).
+crewai[litellm]>=1.15,<2
+
+# Free DuckDuckGo search (the package was renamed from duckduckgo-search to ddgs)
 ddgs>=9.5
+
+# Web UI
 streamlit>=1.40
+
+# Loads GROQ_API_KEY from your local .env file
 python-dotenv>=1.0
+
+# Streamlit Cloud ships an old SQLite that CrewAI's dependency (ChromaDB) rejects.
+# This gives Python a newer one. Linux only, so Windows/macOS installs are unaffected.
+pysqlite3-binary>=0.5.2; sys_platform == "linux"
