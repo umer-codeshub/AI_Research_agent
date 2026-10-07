@@ -1,11 +1,4 @@
-# Agent framework. The [litellm] extra is REQUIRED for Groq (Groq is not a native CrewAI provider).
-crewai[litellm]>=1.15,<2
-
-# Free DuckDuckGo search (the package was renamed from duckduckgo-search to ddgs)
-ddgs>=9.5
-
-# Web UI
-streamlit>=1.40
-
-# Loads GROQ_API_KEY from your local .env file
-python-dotenv>=1.0
+streamlit
+crewai
+groq
+duckduckgo-search
