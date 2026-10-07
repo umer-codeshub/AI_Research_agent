@@ -11,6 +11,8 @@ What lives here:
 app.py (the Streamlit UI) only calls run_research(topic).
 """
 
+import functools
+import inspect
 import os
 import re
 import tempfile
@@ -33,6 +35,72 @@ from dotenv import load_dotenv  # noqa: E402
 # Reads the .env file when running locally. On Streamlit Cloud there is no
 # .env file, and app.py copies the Streamlit secret into the environment instead.
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# 0. Compatibility fix: Groq rejects the "cache_breakpoint" field
+# ---------------------------------------------------------------------------
+# Newer CrewAI versions attach a "cache_breakpoint" key to messages (prompt caching
+# for providers like Anthropic). LiteLLM forwards it to Groq, and Groq answers with
+# "property 'cache_breakpoint' is unsupported". We remove the key right before the call.
+def _strip_unsupported_keys(messages):
+    cleaned = []
+    for message in messages:
+        if isinstance(message, dict):
+            message = {k: v for k, v in message.items() if k != "cache_breakpoint"}
+            content = message.get("content")
+            if isinstance(content, list):
+                message["content"] = [
+                    {k: v for k, v in block.items() if k != "cache_breakpoint"}
+                    if isinstance(block, dict)
+                    else block
+                    for block in content
+                ]
+        cleaned.append(message)
+    return cleaned
+
+
+def _fix_call_arguments(args, kwargs):
+    if isinstance(kwargs.get("messages"), list):
+        kwargs["messages"] = _strip_unsupported_keys(kwargs["messages"])
+    elif len(args) > 1 and isinstance(args[1], list):  # completion(model, messages, ...)
+        args = (args[0], _strip_unsupported_keys(args[1])) + tuple(args[2:])
+    return args, kwargs
+
+
+def _patch_litellm_for_groq():
+    try:
+        import litellm
+    except Exception:
+        return  # LiteLLM missing: nothing to patch (the real error will surface later)
+    if getattr(litellm, "_groq_cache_fix_applied", False):
+        return  # already patched (Streamlit re-runs the script many times)
+
+    for name in ("completion", "acompletion"):
+        original = getattr(litellm, name, None)
+        if original is None:
+            continue
+
+        if inspect.iscoroutinefunction(original):
+
+            @functools.wraps(original)
+            async def wrapper(*args, __orig=original, **kwargs):
+                args, kwargs = _fix_call_arguments(args, kwargs)
+                return await __orig(*args, **kwargs)
+
+        else:
+
+            @functools.wraps(original)
+            def wrapper(*args, __orig=original, **kwargs):
+                args, kwargs = _fix_call_arguments(args, kwargs)
+                return __orig(*args, **kwargs)
+
+        setattr(litellm, name, wrapper)
+
+    litellm._groq_cache_fix_applied = True
+
+
+_patch_litellm_for_groq()
 
 # "groq/" tells CrewAI to use Groq (through LiteLLM).
 # "openai/gpt-oss-120b" is Groq's own model ID.
